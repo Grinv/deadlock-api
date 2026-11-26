@@ -54,6 +54,14 @@ pub async fn get_current_client_version(
     get_client_version_from_github(http_client).await
 }
 
+/// Reads the client version again, bypassing the cache, and caches it. For a Game Coordinator
+/// reply that the version sent is invalid, which usually means a patch just went out.
+pub async fn refresh_client_version(
+    http_client: &reqwest::Client,
+) -> Result<u32, ClientVersionError> {
+    get_current_client_version_prime_cache(http_client).await
+}
+
 async fn get_client_version_from_steam_api(
     http_client: &reqwest::Client,
 ) -> Result<u32, ClientVersionError> {

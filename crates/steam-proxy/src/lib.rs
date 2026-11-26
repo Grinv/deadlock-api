@@ -36,7 +36,7 @@ use valveprotos::deadlock::EgcCitadelClientMessages;
 
 mod client_version;
 
-pub use client_version::{ClientVersionError, get_current_client_version};
+pub use client_version::{ClientVersionError, get_current_client_version, refresh_client_version};
 
 /// Body of a job request to sv-proxy. `S` is the string type of the bot group names.
 #[derive(Debug, Serialize)]

@@ -354,7 +354,34 @@ impl SpectatorBot {
                             .await?;
                         true
                     }
-                    EResponse::KENotInGame | EResponse::KEInvalidClientVersion => {
+                    EResponse::KEInvalidClientVersion => {
+                        // Usually a patch just went out and the cached version is stale. If a newer
+                        // version is accepted, leave the match unmarked so it is tried with it.
+                        // An overridden version is what was sent, so there is nothing to refresh.
+                        let current = if overridden_client_version().is_some() {
+                            None
+                        } else {
+                            steam_proxy::refresh_client_version(&self.client)
+                                .await
+                                .inspect_err(|e| {
+                                    warn!(
+                                        "[{label} {match_id}] Failed to refresh the client version: {}",
+                                        service_utils::ErrorChain(e)
+                                    );
+                                })
+                                .ok()
+                        };
+                        if version_went_up(current_patch, current) {
+                            warn!(
+                                "[{label} {match_id}] Client version {current_patch} is outdated, retrying"
+                            );
+                        } else {
+                            warn!("[{label} {match_id}] Invalid client version: {:?}", &result);
+                            self.mark_spectated(REDIS_FAILED_KEY, &smi).await?;
+                        }
+                        false
+                    }
+                    EResponse::KENotInGame => {
                         warn!("[{label} {match_id}] Match not in game: {:?}", &result);
                         self.mark_spectated(REDIS_FAILED_KEY, &smi).await?;
                         false
@@ -505,6 +532,8 @@ impl SpectatorBot {
                         gaps.len()
                     );
                     for gap_id in gaps.into_iter().take(10) {
+                        // A gap before may have found a newer version.
+                        let current_patch = self.client_version().await?;
                         if let Err(e) = self
                             .spectate_match(
                                 SpectatedMatchType::GapMatch,
@@ -528,6 +557,26 @@ impl SpectatorBot {
 }
 fn overridden_client_version() -> Option<u32> {
     env::var("CLIENT_VERSION").ok()?.parse().ok()
+}
+
+/// Whether the Game Coordinator now accepts a newer version than the one `sent`, so a request
+/// refused for an invalid client version is worth repeating. An older value can come from the
+/// lagging steam.inf fallback.
+fn version_went_up(sent: u32, current: Option<u32>) -> bool {
+    current.is_some_and(|current| current > sent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retries_only_after_the_version_went_up() {
+        assert!(version_went_up(6867, Some(6868)));
+        assert!(!version_went_up(6868, Some(6868)));
+        assert!(!version_went_up(6868, Some(6867)));
+        assert!(!version_went_up(6868, None));
+    }
 }
 
 async fn run_server(bot: Arc<SpectatorBot>) -> std::io::Result<()> {
