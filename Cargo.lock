@@ -3787,6 +3787,7 @@ dependencies = [
  "serde",
  "serde_json",
  "service-utils",
+ "steam-proxy",
  "strum 0.28.0",
  "telemetry",
  "thiserror",
@@ -7296,6 +7297,7 @@ name = "steam-proxy"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "cached",
  "metrics",
  "prost",
  "rand 0.10.4",

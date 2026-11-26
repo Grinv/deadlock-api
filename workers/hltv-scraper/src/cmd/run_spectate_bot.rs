@@ -26,8 +26,6 @@ use valveprotos::deadlock::{
 };
 use valveprotos::gcsdk::EgcPlatform;
 
-use crate::easy_poll::{PollError, start_polling_text};
-
 const BOT_RUNTIME_HOURS: u64 = 6;
 const SPECTATE_COOLDOWN: Duration = Duration::from_millis(10);
 const ERROR_COOLDOWN: Duration = Duration::from_secs(5);
@@ -62,15 +60,9 @@ pub(crate) enum SpectateBotError {
     #[error(transparent)]
     Decode(#[from] prost::DecodeError),
     #[error(transparent)]
-    Poll(#[from] PollError),
+    ClientVersion(#[from] steam_proxy::ClientVersionError),
     #[error(transparent)]
     Timestamp(#[from] jiff::Error),
-    #[error("Failed to parse client version")]
-    ParseClientVersion,
-    #[error("current_patch mutex poisoned: {0}")]
-    PatchMutexPoisoned(String),
-    #[error("No current patch version available")]
-    NoPatchVersion,
     #[error("Spectate bot server stopped")]
     ServerStopped,
     #[error("Spectate bot server failed")]
@@ -151,7 +143,6 @@ struct SpectatorBot {
     api_token: String,
     proxy_url: String,
     failed_spectates: Mutex<LruCache<u64, bool>>,
-    current_patch: Mutex<Option<u32>>,
 }
 
 impl SpectatorBot {
@@ -166,7 +157,6 @@ impl SpectatorBot {
             failed_spectates: Mutex::new(LruCache::new(
                 NonZeroUsize::new(1000).unwrap_or(NonZeroUsize::MIN),
             )),
-            current_patch: Mutex::new(None),
         })
     }
 
@@ -272,18 +262,12 @@ impl SpectatorBot {
             .collect()
     }
 
-    fn update_patch_version(&self, steam_inf: &str) -> Result<()> {
-        let version = steam_inf
-            .split_once("ClientVersion=")
-            .and_then(|(_, rest)| rest.split_once('\n'))
-            .and_then(|(v, _)| v.trim().parse::<u32>().ok())
-            .ok_or(SpectateBotError::ParseClientVersion)?;
-
-        if let Ok(mut current) = self.current_patch.lock() {
-            let overridden = env::var("CLIENT_VERSION").ok().and_then(|s| s.parse().ok());
-            *current = Some(overridden.unwrap_or(version));
+    /// The client version to send: `CLIENT_VERSION` if set, else what the Game Coordinator accepts.
+    async fn client_version(&self) -> Result<u32> {
+        if let Some(version) = overridden_client_version() {
+            return Ok(version);
         }
-        Ok(())
+        Ok(steam_proxy::get_current_client_version(&self.client).await?)
     }
 
     #[tracing::instrument(skip(self), fields(account = field::Empty, ready_bots = field::Empty))]
@@ -293,18 +277,13 @@ impl SpectatorBot {
         match_type: SpectatedMatchType,
         match_id: u64,
         lobby_id: Option<u64>,
+        current_patch: u32,
     ) -> Result<bool> {
         let label = match_type.label();
         if self.is_recently_spectated(REDIS_SPEC_KEY, match_id).await? {
             debug!("[{label} {match_id}] Recently spectated, skipping");
             return Ok(false);
         }
-
-        let current_patch = self
-            .current_patch
-            .lock()
-            .map_err(|e| SpectateBotError::PatchMutexPoisoned(e.to_string()))?
-            .ok_or(SpectateBotError::NoPatchVersion)?;
 
         let spectate_message = CMsgClientToGcSpectateLobby {
             match_id: Some(match_id),
@@ -426,15 +405,9 @@ impl SpectatorBot {
     async fn run(&self, max_spectating_matches: Option<usize>) -> Result<()> {
         let start_time = Instant::now();
 
-        let (abort_handle, steam_inf) = start_polling_text(
-            "https://raw.githubusercontent.com/SteamDatabase/GameTracking-Deadlock/refs/heads/master/game/citadel/steam.inf".to_owned(),
-            Duration::from_mins(5),
-        ).await?;
-        // Stops the poller however this run ends, including the early `?` returns.
-        let _poller = AbortOnDrop(abort_handle);
-
         while start_time.elapsed() < Duration::from_secs(BOT_RUNTIME_HOURS * 3600) {
-            self.update_patch_version(&steam_inf.read().await)?;
+            // Fails the run (retried in 2 minutes) only while no version was ever read.
+            let current_patch = self.client_version().await?;
 
             let recently_spectated = self.get_all_recently_spectated(REDIS_SPEC_KEY).await?;
             let n_spectated = recently_spectated.len();
@@ -483,7 +456,12 @@ impl SpectatorBot {
                     m.lobby_id, m.match_score
                 );
                 if let Err(e) = self
-                    .spectate_match(SpectatedMatchType::ActiveMatch, m.match_id, m.lobby_id)
+                    .spectate_match(
+                        SpectatedMatchType::ActiveMatch,
+                        m.match_id,
+                        m.lobby_id,
+                        current_patch,
+                    )
                     .await
                 {
                     error!("Failed to spectate match {}: {e:?}", m.match_id);
@@ -528,7 +506,12 @@ impl SpectatorBot {
                     );
                     for gap_id in gaps.into_iter().take(10) {
                         if let Err(e) = self
-                            .spectate_match(SpectatedMatchType::GapMatch, gap_id, None)
+                            .spectate_match(
+                                SpectatedMatchType::GapMatch,
+                                gap_id,
+                                None,
+                                current_patch,
+                            )
                             .await
                         {
                             error!("Error spectating gap match {gap_id}: {:?}", e);
@@ -543,13 +526,8 @@ impl SpectatorBot {
         Ok(())
     }
 }
-/// Aborts the task when dropped.
-struct AbortOnDrop(tokio::task::AbortHandle);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
+fn overridden_client_version() -> Option<u32> {
+    env::var("CLIENT_VERSION").ok()?.parse().ok()
 }
 
 async fn run_server(bot: Arc<SpectatorBot>) -> std::io::Result<()> {

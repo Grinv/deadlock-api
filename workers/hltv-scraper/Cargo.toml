@@ -27,6 +27,7 @@ redis = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+steam-proxy = { workspace = true }
 strum = { version = "0.28.0", features = ["derive"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
