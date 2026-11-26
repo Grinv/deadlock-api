@@ -5,6 +5,7 @@ use crate::native::Block;
 use crate::native::block_encoder;
 use crate::native::reader::WireFormat;
 use bytes::BytesMut;
+use core::mem::DropGuard;
 use core::num::Saturating;
 
 pub(crate) struct BlockWriter {
@@ -43,13 +44,9 @@ impl BlockWriter {
 
         // If canceled while sending a block, we have no way to recover.
         // We have to abort the request instead.
-        let mut guard = AbortOnDrop {
-            insert: &mut self.insert,
-            finished: false,
-        };
-
-        guard.insert.send(self.buf.split().freeze()).await?;
-        guard.finished = true;
+        let mut guard = DropGuard::new(&mut self.insert, InsertFormatted::abort);
+        guard.send(self.buf.split().freeze()).await?;
+        DropGuard::dismiss(guard);
 
         self.sent_rows += block.num_rows();
 
@@ -63,18 +60,5 @@ impl BlockWriter {
         );
 
         self.insert.end().await
-    }
-}
-
-struct AbortOnDrop<'a> {
-    insert: &'a mut InsertFormatted,
-    finished: bool,
-}
-
-impl Drop for AbortOnDrop<'_> {
-    fn drop(&mut self) {
-        if !self.finished {
-            self.insert.abort();
-        }
     }
 }
